@@ -1,0 +1,43 @@
+.upload-container {
+  width: 100%;
+  height: 300px;
+  border: 2px dashed #ccc;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.3s;
+  background-color: #fafafa;
+}
+
+.upload-container:hover {
+  border-color: #2a75bb;
+  background-color: #f0f8ff;
+}
+
+.upload-label {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.preview-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain; /* Ensures the whole pokemon fits */
+}
+
+.placeholder {
+  color: #888;
+  font-size: 1.2rem;
+  font-weight: bold;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}

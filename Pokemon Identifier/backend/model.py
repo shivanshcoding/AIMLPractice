@@ -1,19 +1,20 @@
 import os
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Conv2D, MaxPool2D, Flatten, Dense
-from tensorflow.keras.preprocessing import image
+from tensorflow import keras
+from keras.models import Sequential, load_model
+from keras.layers import Conv2D, MaxPool2D, Flatten, Dense, Rescaling
+from keras.utils import image_dataset_from_directory, load_img, img_to_array
 
 class PokemonModel:
-    def __init__(self, model_path='models/pokemon_cnn.h5'):
+    def __init__(self, model_path="models/pokemon_cnn.h5"):
         self.model_path = model_path
         self.img_size = (64, 64)
         self.model = None
-        self.class_indices = {'pikachu': 0, 'raichu': 1} # Default map based on directory sort
 
-        # Load existing model if available
+        # Default fallback (overwritten after training)
+        self.class_indices = ["pikachu", "raichu"] 
+
         if os.path.exists(self.model_path):
             print(f"Loading model from {self.model_path}")
             self.model = load_model(self.model_path)
@@ -21,63 +22,56 @@ class PokemonModel:
             print("No model found. Please train the model first.")
 
     def _build_architecture(self):
-        """Recreates the architecture from your notebook"""
-        cnn = Sequential()
-        
-        # Step 1 - Convolution & Pooling
-        cnn.add(Conv2D(filters=32, kernel_size=3, activation='relu', input_shape=[64, 64, 3]))
-        cnn.add(MaxPool2D(pool_size=2, strides=2))
-        
-        # Second Layer
-        cnn.add(Conv2D(filters=32, kernel_size=3, activation='relu'))
-        cnn.add(MaxPool2D(pool_size=2, strides=2))
-        
-        # Step 3 - Flattening
-        cnn.add(Flatten())
-        
-        # Step 4 - Full Connection
-        cnn.add(Dense(units=128, activation='relu'))
-        
-        # Step 5 - Output Layer (Binary)
-        cnn.add(Dense(units=1, activation='sigmoid'))
-        
-        cnn.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-        return cnn
+        model = Sequential([
+            # Input shape must match image size
+            Conv2D(32, 3, activation="relu", input_shape=(64, 64, 3)),
+            MaxPool2D(2, 2),
+            Conv2D(32, 3, activation="relu"),
+            MaxPool2D(2, 2),
+            Flatten(),
+            Dense(128, activation="relu"),
+            Dense(1, activation="sigmoid")
+        ])
+
+        model.compile(
+            optimizer="adam",
+            loss="binary_crossentropy",
+            metrics=["accuracy"]
+        )
+        return model
 
     def train(self, train_dir, test_dir, epochs=25):
-        """Training pipeline"""
-        # Preprocessing (Augmentation)
-        train_datagen = ImageDataGenerator(
-            rescale=1./255,
-            shear_range=0.2,
-            zoom_range=0.2,
-            horizontal_flip=True
-        )
-        test_datagen = ImageDataGenerator(rescale=1./255)
-
-        training_set = train_datagen.flow_from_directory(
-            train_dir,
-            target_size=self.img_size,
-            batch_size=32,
-            class_mode='binary'
-        )
-
-        test_set = test_datagen.flow_from_directory(
-            test_dir,
-            target_size=self.img_size,
-            batch_size=32,
-            class_mode='binary'
-        )
-
-        # Store class indices to ensure prediction mapping is correct
-        self.class_indices = training_set.class_indices
-        print(f"Class mapping: {self.class_indices}")
-
-        # Build and Train
-        self.model = self._build_architecture()
-        self.model.fit(x=training_set, validation_data=test_set, epochs=epochs)
+        """Training pipeline using Keras 3 API"""
         
-        # Save
+        # 1. Load Data
+        train_ds = image_dataset_from_directory(
+            train_dir,
+            image_size=self.img_size,
+            batch_size=32
+        )
+
+        test_ds = image_dataset_from_directory(
+            test_dir,
+            image_size=self.img_size,
+            batch_size=32
+        )
+
+        # --- FIX IS HERE ---
+        # Capture class names BEFORE mapping. 
+        # .map() returns a new object that doesn't have .class_names
+        self.class_indices = train_ds.class_names
+        print("Classes found:", self.class_indices)
+        # -------------------
+
+        # 2. Normalize images (0-255 -> 0-1)
+        normalization_layer = Rescaling(1.0 / 255)
+        train_ds = train_ds.map(lambda x, y: (normalization_layer(x), y))
+        test_ds = test_ds.map(lambda x, y: (normalization_layer(x), y))
+
+        # 3. Train
+        self.model = self._build_architecture()
+        self.model.fit(train_ds, validation_data=test_ds, epochs=epochs)
+
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         self.model.save(self.model_path)
         print("Model saved successfully.")
@@ -87,27 +81,33 @@ class PokemonModel:
         if self.model is None:
             return "Model not loaded", 0.0
 
-        # Load and preprocess image
-        test_image = image.load_img(img_path, target_size=self.img_size)
-        test_image = image.img_to_array(test_image)
-        test_image = np.expand_dims(test_image, axis=0)
-        
-        # Normalize (Crucial step often missed when moving from notebook to production)
-        test_image = test_image / 255.0
+        try:
+            img = load_img(img_path, target_size=self.img_size)
+            img_array = img_to_array(img)
+            img_array = tf.expand_dims(img_array, axis=0)
+            img_array = img_array / 255.0
 
-        result = self.model.predict(test_image)
-        score = float(result[0][0])
+            score = float(self.model.predict(img_array)[0][0])
+            
+            # Since we are using binary_crossentropy:
+            # The model usually learns classes alphabetically.
+            # If class_indices is ['pikachu', 'raichu']:
+            # 0 = pikachu, 1 = raichu.
+            
+            predicted_index = 1 if score > 0.5 else 0
+            
+            # Safety check if class_indices is list or dict
+            if isinstance(self.class_indices, list):
+                 prediction = self.class_indices[predicted_index]
+            else:
+                 # Fallback for old dictionary style
+                 prediction = list(self.class_indices.keys())[list(self.class_indices.values()).index(predicted_index)]
 
-        # Determine class based on binary output (0 or 1)
-        # Inverting the dictionary map {name: index} -> {index: name}
-        prediction = "Unknown"
-        
-        # Standard logic: < 0.5 is class 0, > 0.5 is class 1
-        predicted_index = 1 if score > 0.5 else 0
-        
-        # Find name for index
-        for name, index in self.class_indices.items():
-            if index == predicted_index:
-                prediction = name
-                
-        return prediction, score
+            # Calculate confidence
+            confidence = score if predicted_index == 1 else 1 - score
+            
+            return prediction, confidence
+            
+        except Exception as e:
+            print(f"Prediction Error: {e}")
+            return "Error", 0.0
