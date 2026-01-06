@@ -1,6 +1,6 @@
 flask
 flask-cors
-tensorflow
-numpy
+torch
+torchvision
+timm
 pillow
-werkzeug
