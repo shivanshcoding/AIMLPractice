@@ -17,30 +17,24 @@ pokemon_model = PokemonModel()
 @app.route('/predict', methods=['POST'])
 def predict():
     if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
-        
+        return jsonify({'error': 'No file uploaded'}), 400
+
     file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-        
-    if file:
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-        
-        try:
-            label, score = pokemon_model.predict(filepath)
-            
-            # Clean up uploaded file
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file.filename))
+    file.save(filepath)
+
+    try:
+        label, score = pokemon_model.predict(filepath)
+        return jsonify({
+            'class': label,
+            'confidence': score
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if os.path.exists(filepath):
             os.remove(filepath)
-            
-            return jsonify({
-                'class': label,
-                'confidence': score,
-                'message': f"I think this is a {label.capitalize()}!"
-            })
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
+
 
 @app.route('/train', methods=['POST'])
 def train():
