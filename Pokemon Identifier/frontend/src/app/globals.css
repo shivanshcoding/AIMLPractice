@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0a0f1e;
+  --foreground: #edf2ff;
+  --card: rgba(15, 23, 42, 0.7);
+  --card-border: rgba(148, 163, 255, 0.18);
+  --glow: rgba(34, 211, 238, 0.25);
+  --neon: rgba(56, 189, 248, 0.45);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-manrope);
+  --font-heading: var(--font-orbitron);
+}
+
+body {
+  background: radial-gradient(900px 500px at 15% -10%, rgba(56, 189, 248, 0.2), transparent),
+    radial-gradient(900px 600px at 85% -20%, rgba(99, 102, 241, 0.25), transparent),
+    linear-gradient(160deg, #0a0f1e 0%, #0b1226 55%, #0c1734 100%);
+  color: var(--foreground);
+  font-family: var(--font-manrope), system-ui, sans-serif;
+  min-height: 100vh;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(700px 400px at 20% 20%, rgba(56, 189, 248, 0.06), transparent),
+    radial-gradient(700px 500px at 80% 30%, rgba(99, 102, 241, 0.06), transparent);
+  pointer-events: none;
+  z-index: -1;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.glass {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 0 16px rgba(15, 23, 42, 0.35);
+}
+
+.neon-border {
+  box-shadow: 0 0 22px var(--glow);
+}
+
+.text-heading {
+  font-family: var(--font-orbitron), system-ui, sans-serif;
+  letter-spacing: 0.04em;
+}
+
+.gradient-text {
+  background: linear-gradient(120deg, #e0f2fe 0%, #bae6fd 40%, #22d3ee 100%);
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+.glass-strong {
+  background: rgba(10, 15, 30, 0.8);
+  border: 1px solid rgba(148, 163, 255, 0.22);
+  box-shadow: 0 0 22px rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(20px);
+}
+
+.glow-button {
+  box-shadow: 0 0 14px rgba(34, 211, 238, 0.35), 0 0 28px rgba(59, 130, 246, 0.15);
+}

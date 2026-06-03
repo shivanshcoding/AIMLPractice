@@ -1,6 +1,9 @@
-flask
-flask-cors
 torch
 torchvision
 timm
 pillow
+fastapi
+uvicorn
+python-multipart
+transformers
+requests

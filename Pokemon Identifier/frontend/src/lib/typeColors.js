@@ -1,0 +1,20 @@
+export const typeColors = {
+  Grass: "bg-emerald-500/20 text-emerald-300 border-emerald-400/40",
+  Fire: "bg-orange-500/20 text-orange-300 border-orange-400/40",
+  Water: "bg-blue-500/20 text-blue-300 border-blue-400/40",
+  Electric: "bg-yellow-400/20 text-yellow-200 border-yellow-300/40",
+  Ice: "bg-cyan-300/20 text-cyan-200 border-cyan-200/40",
+  Fighting: "bg-red-500/20 text-red-300 border-red-400/40",
+  Poison: "bg-purple-500/20 text-purple-300 border-purple-400/40",
+  Ground: "bg-amber-500/20 text-amber-300 border-amber-400/40",
+  Flying: "bg-sky-400/20 text-sky-200 border-sky-300/40",
+  Psychic: "bg-pink-500/20 text-pink-300 border-pink-400/40",
+  Bug: "bg-lime-500/20 text-lime-300 border-lime-400/40",
+  Rock: "bg-stone-500/20 text-stone-300 border-stone-400/40",
+  Ghost: "bg-indigo-500/20 text-indigo-300 border-indigo-400/40",
+  Dragon: "bg-violet-500/20 text-violet-300 border-violet-400/40",
+  Dark: "bg-slate-600/20 text-slate-200 border-slate-400/40",
+  Steel: "bg-slate-400/20 text-slate-100 border-slate-200/40",
+  Fairy: "bg-rose-400/20 text-rose-200 border-rose-300/40",
+  Normal: "bg-zinc-400/20 text-zinc-200 border-zinc-300/40"
+};
