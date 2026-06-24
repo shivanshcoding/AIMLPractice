@@ -265,6 +265,7 @@ warnings.filterwarnings("ignore")
 
 # LangChain / LangGraph
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -642,7 +643,7 @@ print("--- END ---")
 class FixedChunker:
     """Fixed-size chunking with configurable size and overlap."""
     name = "fixed"
-    def __init__(self, chunk_size=512, chunk_overlap=50):
+    def __init__(self, chunk_size=1024, chunk_overlap=150):
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size, chunk_overlap=chunk_overlap,
             separators=["\n\n", "\n", ". ", " ", ""]
@@ -675,7 +676,11 @@ class SemanticChunker:
         try:
             from langchain_experimental.text_splitter import SemanticChunker as SC
             self.splitter = SC(
-                OllamaEmbeddings(model=OLLAMA_CONFIG["embedding_model"]),
+                HuggingFaceBgeEmbeddings(
+                    model_name="BAAI/bge-m3",
+                    model_kwargs={"device": "cuda"},
+                    encode_kwargs={"batch_size": 128, "normalize_embeddings": True}
+                ),
                 breakpoint_threshold_type="percentile",
             )
             self._available = True
@@ -810,7 +815,11 @@ class VectorStoreManager:
 
     def __init__(self, path="/kaggle/working/qdrant_data"):
         self.client = QdrantClient(path=path)
-        self.embedder = OllamaEmbeddings(model=OLLAMA_CONFIG["embedding_model"])
+        self.embedder = HuggingFaceBgeEmbeddings(
+            model_name="BAAI/bge-m3",
+            model_kwargs={"device": "cuda"},
+            encode_kwargs={"batch_size": 32, "normalize_embeddings": True}
+        )
         self._dim = None
         self.collections = {}
 
@@ -835,29 +844,29 @@ class VectorStoreManager:
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
         )
 
-        # Batch embed and upsert
+        # Fast vectorized embedding
         points = []
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
-            texts = [c.page_content for c in batch]
-            try:
-                embeddings = self.embedder.embed_documents(texts)
-            except Exception as e:
-                print(f"[VECTOR] Embedding error at batch {i}: {e}")
-                continue
-            for j, (emb, chunk) in enumerate(zip(embeddings, batch)):
-                point_id = str(uuid.uuid4())
-                payload = {
-                    "text": chunk.page_content,
-                    "metadata": chunk.metadata,
-                    "chunk_index": i + j,
-                }
-                points.append(PointStruct(id=point_id, vector=emb, payload=payload))
-
-        if points:
-            # Upsert in batches
-            for i in range(0, len(points), 100):
-                self.client.upsert(collection_name=collection_name, points=points[i:i+100])
+        try:
+            texts = [c.page_content for c in chunks]
+            embeddings = self.embedder.embed_documents(texts)
+            
+            points = [
+                PointStruct(
+                    id=str(uuid.uuid4()), 
+                    vector=emb, 
+                    payload={"text": chunk.page_content, "metadata": chunk.metadata, "chunk_index": i}
+                ) for i, (emb, chunk) in enumerate(zip(embeddings, chunks))
+            ]
+            
+            if points:
+                # Upsert in large batches
+                self.client.upload_points(
+                    collection_name=collection_name, 
+                    points=points, 
+                    batch_size=256
+                )
+        except Exception as e:
+            print(f"[VECTOR] Embedding error: {e}")
 
         self.collections[name] = collection_name
         print(f"[VECTOR] Collection '{collection_name}': {len(points)} vectors (dim={dim})")
@@ -1055,19 +1064,26 @@ class RetrievalEnsemble:
 
     def retrieve(self, queries: List[str], top_k: int) -> List[ScoredDocument]:
         """Run all configured retrievers on all queries, fuse with RRF."""
+        import concurrent.futures
         # Collect ranked lists: retriever_name -> list of ScoredDocuments
         retriever_results = defaultdict(list)
 
-        for rname, weight in self.config.items():
-            if weight <= 0 or rname not in RETRIEVER_REGISTRY:
-                continue
-            retriever = RETRIEVER_REGISTRY[rname]
-            for query in queries:
+        def fetch(rname, query):
+            return rname, RETRIEVER_REGISTRY[rname].retrieve(query, top_k)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = []
+            for rname, weight in self.config.items():
+                if weight > 0 and rname in RETRIEVER_REGISTRY:
+                    for query in queries:
+                        futures.append(executor.submit(fetch, rname, query))
+                        
+            for future in concurrent.futures.as_completed(futures):
                 try:
-                    results = retriever.retrieve(query, top_k)
+                    rname, results = future.result()
                     retriever_results[rname].extend(results)
                 except Exception as e:
-                    print(f"[RETRIEVAL] {rname} error: {e}")
+                    print(f"[RETRIEVAL] error: {e}")
 
         # RRF fusion
         doc_scores = defaultdict(float)
@@ -1220,7 +1236,7 @@ class BGEReranker:
             return documents
         pairs = [[query, d.content] for d in documents]
         try:
-            scores = self.model.compute_score(pairs)
+            scores = self.model.compute_score(pairs, batch_size=16)
             if isinstance(scores, (int, float)):
                 scores = [scores]
             for d, s in zip(documents, scores):
@@ -1229,7 +1245,7 @@ class BGEReranker:
             documents.sort(key=lambda x: x.score, reverse=True)
         except Exception as e:
             print(f"[RERANKER] BGE scoring error: {e}")
-        return documents
+        return documents[:15]
 
 class CrossEncoderReranker:
     """Sentence-transformers CrossEncoder reranker."""
@@ -1238,7 +1254,7 @@ class CrossEncoderReranker:
         self._available = False
         try:
             from sentence_transformers import CrossEncoder
-            self.model = CrossEncoder(RERANKER_CONFIG["cross_encoder_model"])
+            self.model = CrossEncoder(RERANKER_CONFIG["cross_encoder_model"], device="cuda", max_length=512)
             self._available = True
             print(f"[RERANKER] CrossEncoder loaded: {RERANKER_CONFIG['cross_encoder_model']}")
         except Exception as e:
@@ -1249,7 +1265,10 @@ class CrossEncoderReranker:
             return documents
         pairs = [(query, d.content) for d in documents]
         try:
-            scores = self.model.predict(pairs)
+            scores = self.model.predict(pairs, batch_size=16, show_progress_bar=False, convert_to_tensor=True)
+            scores = scores.cpu().tolist()
+            if isinstance(scores, (int, float)):
+                scores = [scores]
             for d, s in zip(documents, scores):
                 d.score = float(s)
                 d.source_retriever = f"{d.source_retriever}+ce"
@@ -1360,7 +1379,7 @@ class LLMCompressor:
             "Query: {query}\n\nPassages:\n{passages}"
         )
     def compress(self, query: str, documents: List[ScoredDocument]) -> List[ScoredDocument]:
-        passages = "\n---\n".join(d.content[:500] for d in documents[:8])
+        passages = "\n---\n".join([f"[{i}]: {d.content[:500]}" for i, d in enumerate(documents[:5])])
         try:
             chain = self.prompt | self.llm | StrOutputParser()
             summary = chain.invoke({"query": query, "passages": passages})
@@ -1375,7 +1394,6 @@ class LLMCompressor:
 
 COMPRESSOR_REGISTRY = {
     "redundancy_removal": RedundancyRemovalCompressor,
-    "contextual": ContextualCompressor,
     "llm": LLMCompressor,
 }
 
@@ -1614,17 +1632,24 @@ def strategy_selection_node(state: RAREState) -> dict:
 def query_optimization_node(state: RAREState) -> dict:
     t0 = time.time()
     query = state["query"]
-    optimizer_names = state.get("selected_optimizers", [])
-
-    all_queries = {query}  # Use set to avoid duplicates
-    for opt_name in optimizer_names:
-        if opt_name in OPTIMIZER_REGISTRY:
-            try:
-                optimizer = OPTIMIZER_REGISTRY[opt_name]()
-                expanded = optimizer.optimize(query)
-                all_queries.update(expanded)
-            except Exception as e:
-                print(f"[OPTIMIZER] {opt_name} error: {e}")
+    q_type = state.get("query_type", "factual")
+    
+    # Conditional Routing
+    if q_type == "conceptual":
+        optimizer_names = ["hyde"]
+    elif q_type == "analytical":
+        optimizer_names = ["multi_query"]
+    else:
+        optimizer_names = ["query_expansion"]
+        
+    # Execute single best optimizer
+    all_queries = {query}
+    if optimizer_names[0] in OPTIMIZER_REGISTRY:
+        try:
+            expanded = OPTIMIZER_REGISTRY[optimizer_names[0]]().optimize(query)
+            all_queries.update(expanded)
+        except Exception as e:
+            print(f"[OPTIMIZER] {optimizer_names[0]} error: {e}")
 
     latency = time.time() - t0
     return {
@@ -1937,6 +1962,8 @@ class RAREEvaluator:
         self.model = None
         try:
             from deepeval.models import OllamaModel
+            import os
+            os.environ["DEEPEVAL_WORKERS"] = "1"
             self.model = OllamaModel(
                 model=OLLAMA_CONFIG["evaluation_model"],
                 base_url="http://localhost:11434",
