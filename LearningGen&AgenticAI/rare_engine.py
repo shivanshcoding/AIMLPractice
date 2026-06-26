@@ -15,8 +15,10 @@
 # - Ensemble reranking (BGE + CrossEncoder)
 # - Context compression (Redundancy removal, Contextual, LLM)
 # - Self-correcting retrieval with confidence-based retry loops
+# - CRAG (Corrective RAG) with web search fallback
 # - LangGraph workflow orchestration with conditional routing
 # - Manual mode (full config control) and Agent mode (autonomous strategy selection)
+# - Separate Ingestion Agent for document processing
 # - DeepEval evaluation with Ollama
 # - Benchmarking with CSV/leaderboard output
 # - LangSmith observability (optional)
@@ -39,6 +41,7 @@ packages = [
     "deepeval",
     "langsmith",
     "tabulate",
+    "duckduckgo-search",
 ]
 
 print("Installing packages...")
@@ -163,8 +166,9 @@ CONFIG = {
 
     "compression": "contextual",
 
-    "top_k": 15,
-    "confidence_threshold": 0.85,
+    "top_k_retrieval": 20,
+    "top_k_reranked": 10,
+    "confidence_threshold": 0.75,
     "max_retries": 3,
 }
 
@@ -188,6 +192,8 @@ LANGSMITH_CONFIG = {
 # RERANKER MODEL CONFIGURATION
 # ---------------------------------------------------------------------------
 RERANKER_CONFIG = {
+    "bge": 0.7,
+    "cross_encoder": 0.3,
     "bge_model": "BAAI/bge-reranker-v2-m3",
     "cross_encoder_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
 }
@@ -205,7 +211,8 @@ print(f"Retrievers       : {list(CONFIG['retrievers'].keys())}")
 print(f"Rerankers        : {list(CONFIG['rerankers'].keys())}")
 print(f"Optimizers       : {CONFIG['query_optimizers']}")
 print(f"Compression      : {CONFIG['compression']}")
-print(f"Top K            : {CONFIG['top_k']}")
+print(f"Top K Retrieval  : {CONFIG['top_k_retrieval']}")
+print(f"Top K Reranked   : {CONFIG['top_k_reranked']}")
 print(f"Confidence Thresh: {CONFIG['confidence_threshold']}")
 print("--- END ---")
 
@@ -268,7 +275,7 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import StateGraph, END
 
@@ -278,6 +285,16 @@ from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, Fi
 
 # BM25
 from rank_bm25 import BM25Okapi
+
+# Web Search (for CRAG)
+try:
+    from langchain_community.tools import DuckDuckGoSearchResults
+    from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+    _WEB_SEARCH_AVAILABLE = True
+    print("[IMPORTS] DuckDuckGo web search available.")
+except ImportError:
+    _WEB_SEARCH_AVAILABLE = False
+    print("[IMPORTS] DuckDuckGo web search NOT available. CRAG fallback disabled.")
 
 print("[IMPORTS] All core imports successful.")
 
@@ -310,6 +327,7 @@ class PipelineTrace:
     docs_after_rerank: int = 0
     docs_final: int = 0
     retry_count: int = 0
+    web_search_used: bool = False
     node_latencies: Dict[str, float] = field(default_factory=dict)
     total_latency: float = 0.0
 
@@ -830,11 +848,11 @@ class VectorStoreManager:
         return self._dim
 
     def create_collection(self, name: str, chunks: List[Document], batch_size: int = 32):
-        """Embed and store chunks in a named collection."""
+        """Embed and store chunks in a named collection. Deletes existing collection first."""
         collection_name = f"rare_{name}"
         dim = self._get_dim()
 
-        # Recreate collection
+        # Always delete existing collection before creating new
         try:
             self.client.delete_collection(collection_name)
         except Exception:
@@ -871,6 +889,16 @@ class VectorStoreManager:
         self.collections[name] = collection_name
         print(f"[VECTOR] Collection '{collection_name}': {len(points)} vectors (dim={dim})")
         return collection_name
+
+    def delete_all_collections(self):
+        """Delete all managed collections for clean re-indexing."""
+        for name, collection_name in list(self.collections.items()):
+            try:
+                self.client.delete_collection(collection_name)
+                print(f"[VECTOR] Deleted collection '{collection_name}'")
+            except Exception:
+                pass
+        self.collections.clear()
 
     def search(self, collection_name: str, query: str, top_k: int = 10) -> List[ScoredDocument]:
         """Search a collection by query embedding."""
@@ -919,6 +947,11 @@ class BM25Index:
         self.doc_store[name] = chunks
         print(f"[BM25] Index '{name}': {len(chunks)} documents")
 
+    def clear_all(self):
+        """Clear all indices for clean re-indexing."""
+        self.indices.clear()
+        self.doc_store.clear()
+
     def search(self, name: str, query: str, top_k: int = 10) -> List[ScoredDocument]:
         if name not in self.indices:
             return []
@@ -944,6 +977,76 @@ for chunker_name, chunks in chunked_docs.items():
         bm25_index.build(chunker_name, chunks)
 
 print("[BM25] All indices built.")
+
+# ====================================================================
+# ## Section 9b: Ingestion Agent
+#
+# Encapsulates the full ingestion pipeline (load + chunk + index).
+# Invoked on first query and when agent mode selects different chunkers.
+# ====================================================================
+
+# Track which chunkers have been indexed
+_indexed_chunkers = set(CONFIG["chunkers"].keys())
+_ingestion_completed = True  # Initial ingestion done above
+
+
+class IngestionAgent:
+    """Manages document ingestion, chunking, and indexing as a cohesive unit.
+    
+    Handles cleanup of existing vector stores/BM25 indices before re-indexing
+    to avoid Qdrant errors from duplicate collection creation.
+    """
+
+    def __init__(self, vector_mgr: VectorStoreManager, bm25_idx: BM25Index):
+        self.vector_manager = vector_mgr
+        self.bm25_index = bm25_idx
+
+    def run(self, documents: List[Document], chunker_config: dict) -> Tuple[Dict[str, List[Document]], dict]:
+        """Execute full chunking + indexing pipeline.
+        
+        Args:
+            documents: Raw loaded documents.
+            chunker_config: Dict of {chunker_name: weight}.
+            
+        Returns:
+            Tuple of (chunked_docs dict, parent_stores dict).
+        """
+        global _indexed_chunkers, chunk_ensemble, chunked_docs
+
+        print(f"[INGESTION-AGENT] Running ingestion for chunkers: {list(chunker_config.keys())}")
+
+        # Step 1: Clean up existing indices
+        self.vector_manager.delete_all_collections()
+        self.bm25_index.clear_all()
+
+        # Step 2: Chunk documents
+        ensemble = ChunkEnsemble(chunker_config)
+        new_chunked_docs = ensemble.chunk(documents)
+
+        # Step 3: Build vector stores
+        for chunker_name, chunks in new_chunked_docs.items():
+            if chunks:
+                self.vector_manager.create_collection(chunker_name, chunks)
+
+        # Step 4: Build BM25 indices
+        for chunker_name, chunks in new_chunked_docs.items():
+            if chunks:
+                self.bm25_index.build(chunker_name, chunks)
+
+        # Step 5: Update globals
+        chunk_ensemble = ensemble
+        chunked_docs = new_chunked_docs
+        _indexed_chunkers = set(chunker_config.keys())
+
+        # Step 6: Rebuild retrievers
+        build_retrievers()
+
+        print(f"[INGESTION-AGENT] Indexing complete. Collections: {list(self.vector_manager.collections.keys())}")
+        return new_chunked_docs, ensemble.parent_stores
+
+
+ingestion_agent = IngestionAgent(vector_manager, bm25_index)
+print("[INGESTION-AGENT] Ready.")
 
 # ====================================================================
 # ## Section 10: Retrieval Engine
@@ -986,10 +1089,24 @@ class MetadataRetriever:
 
     def _extract_keywords(self, query: str) -> List[str]:
         try:
-            prompt = ChatPromptTemplate.from_template(
-                "Extract 2-4 key technical terms from this query. "
-                "Return ONLY a comma-separated list, nothing else.\nQuery: {query}"
-            )
+            prompt = ChatPromptTemplate.from_messages([
+                ("system",
+                 "You are a precise keyword extraction engine for information retrieval systems. "
+                 "Your task is to identify the most discriminative technical terms from a search query "
+                 "that will maximize retrieval precision."),
+                ("human",
+                 "Extract 2-4 key technical terms from this query that are most useful for document retrieval.\n\n"
+                 "Rules:\n"
+                 "- Select ONLY domain-specific technical terms, not common words.\n"
+                 "- Prefer noun phrases and proper nouns.\n"
+                 "- Return ONLY a comma-separated list, nothing else.\n"
+                 "- No explanations, no numbering, no bullet points.\n\n"
+                 "Example:\n"
+                 "Query: 'How does HNSW indexing work in vector databases?'\n"
+                 "Output: HNSW, indexing, vector databases\n\n"
+                 "Query: {query}\n"
+                 "Output:")
+            ])
             chain = prompt | self.llm | StrOutputParser()
             result = chain.invoke({"query": query})
             return [kw.strip().lower() for kw in result.split(",") if kw.strip()]
@@ -1126,6 +1243,7 @@ print("[ENSEMBLE] RetrievalEnsemble ready.")
 # ## Section 11: Query Optimization
 # 
 # Multiple query optimization strategies can be enabled simultaneously.
+# Enhanced with persona, chain-of-thought, few-shot examples, and structured output.
 # ====================================================================
 
 class MultiQueryOptimizer:
@@ -1133,12 +1251,30 @@ class MultiQueryOptimizer:
     name = "multi_query"
     def __init__(self):
         self.llm = ChatOllama(model=OLLAMA_CONFIG["query_optimizer_model"], temperature=0.7)
-        self.prompt = ChatPromptTemplate.from_template(
-            "Generate 3 alternative search queries for the following question. "
-            "Each should approach the topic from a different angle.\n"
-            "Return ONLY the 3 queries, one per line, no numbering.\n\n"
-            "Original: {query}"
-        )
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are an expert search query reformulation specialist. Your goal is to maximize "
+             "document recall by generating diverse query variants that capture different aspects "
+             "and phrasings of the user's information need.\n\n"
+             "Think step-by-step:\n"
+             "1. Identify the core information need.\n"
+             "2. Consider different angles: synonyms, related concepts, more specific terms, broader terms.\n"
+             "3. Generate 3 alternative queries, each approaching from a DIFFERENT angle."),
+            ("human",
+             "Generate 3 alternative search queries for the following question.\n\n"
+             "Rules:\n"
+             "- Each query must approach the topic from a DIFFERENT angle.\n"
+             "- Use diverse vocabulary and phrasing.\n"
+             "- Maintain the original intent.\n"
+             "- Return ONLY the 3 queries, one per line.\n"
+             "- No numbering, no explanations, no prefixes.\n\n"
+             "Examples:\n"
+             "Original: 'What is RAG?'\n"
+             "retrieval augmented generation architecture overview\n"
+             "how does RAG combine retrieval with language model generation\n"
+             "RAG framework components and pipeline design\n\n"
+             "Original: {query}")
+        ])
     def optimize(self, query: str) -> List[str]:
         try:
             chain = self.prompt | self.llm | StrOutputParser()
@@ -1153,11 +1289,26 @@ class QueryExpansionOptimizer:
     name = "query_expansion"
     def __init__(self):
         self.llm = ChatOllama(model=OLLAMA_CONFIG["query_optimizer_model"], temperature=0.3)
-        self.prompt = ChatPromptTemplate.from_template(
-            "Expand this search query by adding relevant technical terms, "
-            "synonyms, and related concepts. Return a single expanded query.\n\n"
-            "Original: {query}"
-        )
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are a domain-expert query expansion engine. Your role is to enrich search queries "
+             "with relevant technical terminology, synonyms, and related concepts to improve "
+             "document retrieval recall without changing the original intent.\n\n"
+             "Think step-by-step:\n"
+             "1. Identify the key technical terms in the query.\n"
+             "2. Find synonyms, acronyms, and related technical terms.\n"
+             "3. Add contextual terms that commonly co-occur with the topic.\n"
+             "4. Combine into a single enriched query."),
+            ("human",
+             "Expand this search query by adding relevant technical terms, synonyms, "
+             "and related concepts. Return ONLY a single expanded query, nothing else.\n\n"
+             "Example:\n"
+             "Original: 'How does HNSW work?'\n"
+             "Expanded: 'How does HNSW hierarchical navigable small world graph-based approximate "
+             "nearest neighbor ANN search indexing work for vector similarity retrieval'\n\n"
+             "Original: {query}\n"
+             "Expanded:")
+        ])
     def optimize(self, query: str) -> List[str]:
         try:
             chain = self.prompt | self.llm | StrOutputParser()
@@ -1167,15 +1318,33 @@ class QueryExpansionOptimizer:
             return [query]
 
 class HyDEOptimizer:
-    """Generates a hypothetical answer to use as retrieval query."""
+    """Generates a hypothetical answer to use as retrieval query (HyDE)."""
     name = "hyde"
     def __init__(self):
         self.llm = ChatOllama(model=OLLAMA_CONFIG["query_optimizer_model"], temperature=0.5)
-        self.prompt = ChatPromptTemplate.from_template(
-            "Write a short, factual paragraph that would be the ideal answer to this question. "
-            "This will be used as a search query. Do not explain, just write the answer.\n\n"
-            "Question: {query}"
-        )
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are a domain expert writing a hypothetical document passage that would perfectly "
+             "answer a given question. This passage will be used as a search query to find similar "
+             "real documents via embedding similarity.\n\n"
+             "Guidelines:\n"
+             "- Write a factual, information-dense paragraph (3-5 sentences).\n"
+             "- Use technical vocabulary that real documents would contain.\n"
+             "- Include specific details, not vague statements.\n"
+             "- Do NOT add disclaimers or caveats.\n"
+             "- Do NOT say 'I think' or 'It is possible'."),
+            ("human",
+             "Write a short, factual paragraph that would be the ideal answer to this question. "
+             "This will be used as a search query. Write ONLY the answer paragraph, nothing else.\n\n"
+             "Example:\n"
+             "Question: 'What is semantic chunking?'\n"
+             "Answer: 'Semantic chunking is a text segmentation technique that splits documents at "
+             "topic boundaries detected by embedding similarity. It computes sentence-level embeddings "
+             "and identifies breakpoints where cosine similarity between consecutive sentences drops "
+             "below a threshold, producing semantically coherent chunks that preserve meaning and context.'\n\n"
+             "Question: {query}\n"
+             "Answer:")
+        ])
     def optimize(self, query: str) -> List[str]:
         try:
             chain = self.prompt | self.llm | StrOutputParser()
@@ -1189,12 +1358,24 @@ class StepBackOptimizer:
     name = "step_back"
     def __init__(self):
         self.llm = ChatOllama(model=OLLAMA_CONFIG["query_optimizer_model"], temperature=0.3)
-        self.prompt = ChatPromptTemplate.from_template(
-            "Given this specific question, generate a more general, abstract question "
-            "that would help retrieve broader background information.\n"
-            "Return ONLY the abstract question.\n\n"
-            "Specific: {query}"
-        )
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are a query abstraction specialist. Given a specific, narrow question, your job "
+             "is to formulate a broader, more fundamental question that would retrieve background "
+             "documents providing essential context for answering the original question.\n\n"
+             "Think step-by-step:\n"
+             "1. Identify the specific concept in the question.\n"
+             "2. Determine the broader category or principle it belongs to.\n"
+             "3. Formulate a question about that broader category."),
+            ("human",
+             "Given this specific question, generate a more general, abstract question "
+             "that captures the broader topic. Return ONLY the abstract question, nothing else.\n\n"
+             "Example:\n"
+             "Specific: 'How does HNSW handle dynamic insertions?'\n"
+             "Abstract: 'What are the fundamental indexing strategies for approximate nearest neighbor search?'\n\n"
+             "Specific: {query}\n"
+             "Abstract:")
+        ])
     def optimize(self, query: str) -> List[str]:
         try:
             chain = self.prompt | self.llm | StrOutputParser()
@@ -1245,7 +1426,7 @@ class BGEReranker:
             documents.sort(key=lambda x: x.score, reverse=True)
         except Exception as e:
             print(f"[RERANKER] BGE scoring error: {e}")
-        return documents[:15]
+        return documents
 
 class CrossEncoderReranker:
     """Sentence-transformers CrossEncoder reranker."""
@@ -1282,12 +1463,12 @@ class EnsembleReranker:
     def __init__(self, reranker_config: dict):
         self.config = reranker_config
         self.rerankers = {}
-        if "bge" in reranker_config:
+        if reranker_config.get("bge", 0) > 0:
             self.rerankers["bge"] = BGEReranker()
-        if "cross_encoder" in reranker_config:
+        if reranker_config.get("cross_encoder", 0) > 0:
             self.rerankers["cross_encoder"] = CrossEncoderReranker()
 
-    def rerank(self, query: str, documents: List[ScoredDocument]) -> List[ScoredDocument]:
+    def rerank(self, query: str, documents: List[ScoredDocument], top_k_reranked: int = 10) -> List[ScoredDocument]:
         if not documents:
             return documents
 
@@ -1314,16 +1495,17 @@ class EnsembleReranker:
             doc.score = combined
 
         documents.sort(key=lambda x: x.score, reverse=True)
-        return documents
+        return documents[:top_k_reranked]
 
 # Initialize rerankers
-ensemble_reranker = EnsembleReranker(CONFIG["rerankers"])
+ensemble_reranker = EnsembleReranker(RERANKER_CONFIG)
 print("[RERANKERS] Ensemble ready.")
 
 # ====================================================================
 # ## Section 13: Context Compression
 # 
 # Three compression strategies to reduce context size while preserving relevance.
+# Enhanced with detailed prompt engineering for high-quality output.
 # ====================================================================
 
 class RedundancyRemovalCompressor:
@@ -1346,11 +1528,24 @@ class ContextualCompressor:
     name = "contextual"
     def __init__(self):
         self.llm = ChatOllama(model=OLLAMA_CONFIG["generation_model"], temperature=0)
-        self.prompt = ChatPromptTemplate.from_template(
-            "Extract ONLY the sentences from the following text that are directly relevant "
-            "to answering the query. If nothing is relevant, respond with 'NOT_RELEVANT'.\n\n"
-            "Query: {query}\n\nText: {text}"
-        )
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are a precise context extraction engine for a Retrieval-Augmented Generation system. "
+             "Your task is to extract ONLY the sentences and phrases that are directly relevant to "
+             "answering the user's query.\n\n"
+             "Extraction Rules:\n"
+             "1. Preserve the EXACT wording of relevant sentences — do not paraphrase.\n"
+             "2. Include complete sentences, not fragments.\n"
+             "3. Preserve technical terms, numbers, and specific data points.\n"
+             "4. If a sentence provides essential context for understanding a relevant sentence, include it.\n"
+             "5. If NOTHING in the text is relevant, respond with exactly: NOT_RELEVANT\n"
+             "6. Do NOT add explanations, commentary, or your own knowledge."),
+            ("human",
+             "Extract ONLY the sentences relevant to answering this query.\n\n"
+             "Query: {query}\n\n"
+             "Text:\n{text}\n\n"
+             "Relevant Sentences:")
+        ])
     def compress(self, query: str, documents: List[ScoredDocument]) -> List[ScoredDocument]:
         chain = self.prompt | self.llm | StrOutputParser()
         compressed = []
@@ -1369,17 +1564,36 @@ class ContextualCompressor:
         return compressed if compressed else documents[:5]
 
 class LLMCompressor:
-    """LLM summarizes combined context into a concise passage."""
+    """LLM summarizes combined context into a comprehensive, high-quality passage."""
     name = "llm"
     def __init__(self):
         self.llm = ChatOllama(model=OLLAMA_CONFIG["generation_model"], temperature=0)
-        self.prompt = ChatPromptTemplate.from_template(
-            "Condense the following retrieved passages into a single concise summary "
-            "that preserves all information relevant to the query.\n\n"
-            "Query: {query}\n\nPassages:\n{passages}"
-        )
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are an expert technical summarizer for a Retrieval-Augmented Generation system. "
+             "Your task is to produce a comprehensive, high-quality summary that preserves ALL key "
+             "information from the retrieved passages.\n\n"
+             "Summary Quality Requirements:\n"
+             "1. COMPLETENESS: Cover every distinct point, fact, and concept from ALL passages.\n"
+             "2. ACCURACY: Preserve exact technical terms, numbers, metrics, and specific claims.\n"
+             "3. STRUCTURE: Use clear logical flow — group related information together.\n"
+             "4. SPECIFICITY: Keep concrete details; do not generalize or abstract away specifics.\n"
+             "5. FIDELITY: Only include information present in the passages — no external knowledge.\n"
+             "6. SELF-CHECK: After drafting, verify that no key point from any passage was omitted.\n\n"
+             "Think step-by-step:\n"
+             "1. Read all passages and identify key points from each.\n"
+             "2. Group related points across passages.\n"
+             "3. Write a structured summary covering all points.\n"
+             "4. Verify completeness against the original passages."),
+            ("human",
+             "Condense the following retrieved passages into a single comprehensive summary "
+             "that preserves ALL information relevant to the query. Cover every key point.\n\n"
+             "Query: {query}\n\n"
+             "Passages:\n{passages}\n\n"
+             "Comprehensive Summary:")
+        ])
     def compress(self, query: str, documents: List[ScoredDocument]) -> List[ScoredDocument]:
-        passages = "\n---\n".join([f"[{i}]: {d.content[:500]}" for i, d in enumerate(documents[:5])])
+        passages = "\n---\n".join([f"[Passage {i+1}]: {d.content[:1000]}" for i, d in enumerate(documents[:8])])
         try:
             chain = self.prompt | self.llm | StrOutputParser()
             summary = chain.invoke({"query": query, "passages": passages})
@@ -1393,6 +1607,7 @@ class LLMCompressor:
             return documents[:5]
 
 COMPRESSOR_REGISTRY = {
+    "contextual": ContextualCompressor,
     "redundancy_removal": RedundancyRemovalCompressor,
     "llm": LLMCompressor,
 }
@@ -1437,6 +1652,7 @@ class ExplainabilityLogger:
         print(f"Retrieval Confidence  : {trace.confidence_score:.4f}")
         print(f"Retry Required        : {trace.confidence_score < CONFIG['confidence_threshold']}")
         print(f"Retry Count           : {trace.retry_count}")
+        print(f"Web Search Used       : {trace.web_search_used}")
         print("--- END ---")
 
     def log_summary(self, trace: PipelineTrace):
@@ -1448,6 +1664,7 @@ class ExplainabilityLogger:
         print(f"Rerankers     : {trace.rerankers_used}")
         print(f"Compression   : {trace.compression_strategy}")
         print(f"Confidence    : {trace.confidence_score:.4f}")
+        print(f"Web Search    : {trace.web_search_used}")
         print(f"Total Latency : {trace.total_latency:.3f}s")
         print(f"Documents Used: {trace.docs_final}")
         for node, lat in trace.node_latencies.items():
@@ -1467,15 +1684,92 @@ explainability = ExplainabilityLogger()
 print("[LOGGER] ExplainabilityLogger ready.")
 
 # ====================================================================
+# ## Section 13b: Web Search (CRAG Support)
+# 
+# DuckDuckGo web search for Corrective RAG fallback.
+# ====================================================================
+
+class WebSearchEngine:
+    """Web search via DuckDuckGo for CRAG fallback when retrieval confidence is low."""
+
+    def __init__(self):
+        self._available = _WEB_SEARCH_AVAILABLE
+        if self._available:
+            try:
+                self.wrapper = DuckDuckGoSearchAPIWrapper(max_results=5)
+                self.tool = DuckDuckGoSearchResults(api_wrapper=self.wrapper)
+                print("[WEB-SEARCH] DuckDuckGo search engine initialized.")
+            except Exception as e:
+                print(f"[WEB-SEARCH] Initialization error: {e}")
+                self._available = False
+
+    def search(self, query: str, num_results: int = 5) -> List[ScoredDocument]:
+        """Execute web search and return results as ScoredDocuments."""
+        if not self._available:
+            print("[WEB-SEARCH] Web search not available.")
+            return []
+
+        try:
+            raw_results = self.tool.invoke(query)
+
+            # Parse results
+            docs = []
+            if isinstance(raw_results, str):
+                # DuckDuckGo returns a string representation of results
+                # Parse individual snippets
+                snippets = re.findall(r'snippet:\s*(.*?)(?:,\s*title:|,\s*link:|$)', raw_results, re.DOTALL)
+                titles = re.findall(r'title:\s*(.*?)(?:,\s*snippet:|,\s*link:|$)', raw_results, re.DOTALL)
+                links = re.findall(r'link:\s*(.*?)(?:,\s*snippet:|,\s*title:|]|$)', raw_results, re.DOTALL)
+
+                for i, snippet in enumerate(snippets):
+                    snippet = snippet.strip().strip("'\"")
+                    if snippet:
+                        title = titles[i].strip().strip("'\"") if i < len(titles) else ""
+                        link = links[i].strip().strip("'\"") if i < len(links) else ""
+                        content = f"{title}\n{snippet}" if title else snippet
+                        docs.append(ScoredDocument(
+                            content=content,
+                            score=1.0 - (i * 0.1),  # Decreasing score by rank
+                            metadata={
+                                "source": "web_search",
+                                "title": title,
+                                "url": link,
+                                "rank": i + 1,
+                            },
+                            source_retriever="web_search",
+                        ))
+
+                # Fallback: if parsing failed, use the raw string
+                if not docs and raw_results.strip():
+                    docs.append(ScoredDocument(
+                        content=raw_results[:2000],
+                        score=0.5,
+                        metadata={"source": "web_search", "raw": True},
+                        source_retriever="web_search",
+                    ))
+
+            print(f"[WEB-SEARCH] Retrieved {len(docs)} web results for: '{query[:60]}...'")
+            return docs[:num_results]
+
+        except Exception as e:
+            print(f"[WEB-SEARCH] Search error: {e}")
+            return []
+
+
+web_search_engine = WebSearchEngine()
+
+# ====================================================================
 # ## Section 14: LangGraph Workflow
 # 
 # The complete retrieval pipeline orchestrated as a LangGraph state machine with
-# conditional routing for self-correcting retrieval.
+# conditional routing for self-correcting retrieval and CRAG web search fallback.
 # 
 # ```
-# Query Analysis -> Strategy Selection -> Query Optimization -> Retrieval
-# -> Reranking -> Confidence Evaluation --(low confidence)--> Retry Loop
-#                                       --(high confidence)--> Compression -> Response
+# Query Analysis -> Strategy Selection -> Ingestion (if needed) -> Query Optimization
+# -> Retrieval -> Reranking -> Confidence Evaluation
+#   --(low confidence, retries left)--> Retry Adjustment -> Query Optimization
+#   --(low confidence, final retry)---> Web Search + Retry -> Query Optimization
+#   --(high confidence)---------------> Compression -> Response
 # ```
 # ====================================================================
 
@@ -1497,7 +1791,8 @@ class RAREState(TypedDict):
     selected_optimizers: list
     selected_rerankers: dict
     selected_compression: str
-    selected_top_k: int
+    selected_top_k_retrieval: int
+    selected_top_k_reranked: int
 
     # Execution Data
     optimized_queries: list
@@ -1511,6 +1806,10 @@ class RAREState(TypedDict):
     context_quality: float
     retry_count: int
     max_retries: int
+
+    # CRAG
+    web_search_used: bool
+    web_search_documents: list
 
     # Output
     final_answer: str
@@ -1533,11 +1832,22 @@ def query_analysis_node(state: RAREState) -> dict:
     query = state["query"]
     llm = ChatOllama(model=OLLAMA_CONFIG["generation_model"], temperature=0)
 
-    # Classify query type
-    classify_prompt = ChatPromptTemplate.from_template(
-        "Classify this query into exactly one category: factual, analytical, procedural, comparative.\n"
-        "Return ONLY the category name, nothing else.\n\nQuery: {query}"
-    )
+    # Classify query type with enhanced prompt
+    classify_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a query classification expert for an information retrieval system. "
+         "Classify each query into exactly ONE of these categories:\n\n"
+         "- factual: Seeks a specific fact, definition, or piece of information.\n"
+         "  Example: 'What is RAG?', 'Define cosine similarity'\n"
+         "- analytical: Requires analysis, explanation of mechanisms, or reasoning.\n"
+         "  Example: 'How does HNSW achieve logarithmic search complexity?'\n"
+         "- procedural: Asks about steps, processes, or how-to instructions.\n"
+         "  Example: 'How to implement a vector database?', 'Steps to build a RAG pipeline'\n"
+         "- comparative: Compares two or more concepts, methods, or approaches.\n"
+         "  Example: 'Compare dense and BM25 retrieval', 'Differences between IVF and HNSW'\n\n"
+         "Respond with ONLY the category name. No explanation."),
+        ("human", "Query: {query}\nCategory:")
+    ])
     try:
         chain = classify_prompt | llm | StrOutputParser()
         query_type = chain.invoke({"query": query}).strip().lower()
@@ -1546,11 +1856,24 @@ def query_analysis_node(state: RAREState) -> dict:
     except Exception:
         query_type = "factual"
 
-    # Extract entities
-    entity_prompt = ChatPromptTemplate.from_template(
-        "Extract key technical entities/terms from this query. "
-        "Return a comma-separated list.\n\nQuery: {query}"
-    )
+    # Extract entities with enhanced prompt
+    entity_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a Named Entity Recognition (NER) specialist for technical and scientific text. "
+         "Extract key technical entities, concepts, and proper nouns from the query.\n\n"
+         "Rules:\n"
+         "- Return ONLY a comma-separated list.\n"
+         "- Include: technical terms, algorithms, frameworks, metrics, data structures.\n"
+         "- Exclude: common verbs, prepositions, articles, generic words.\n"
+         "- No explanation, no numbering, no bullet points."),
+        ("human",
+         "Extract technical entities from this query.\n\n"
+         "Example:\n"
+         "Query: 'How does HNSW indexing work in vector databases?'\n"
+         "Entities: HNSW, indexing, vector databases\n\n"
+         "Query: {query}\n"
+         "Entities:")
+    ])
     try:
         chain = entity_prompt | llm | StrOutputParser()
         entities_str = chain.invoke({"query": query})
@@ -1572,21 +1895,54 @@ def strategy_selection_node(state: RAREState) -> dict:
     cfg = state.get("config_override") or CONFIG
 
     if cfg.get("agent_mode", False):
-        # Agent autonomously selects strategies
+        # Agent autonomously selects strategies with enhanced prompt
         llm = ChatOllama(model=OLLAMA_CONFIG["generation_model"], temperature=0.3)
-        agent_prompt = ChatPromptTemplate.from_template(
-            "You are a retrieval strategy expert. Select the optimal retrieval configuration.\n\n"
-            "Query: {query}\nQuery Type: {query_type}\n"
-            "Available chunkers: semantic, parent_child, recursive, fixed, document_aware\n"
-            "Available retrievers: dense, bm25, metadata, parent_child\n"
-            "Available optimizers: multi_query, hyde, step_back, query_expansion\n"
-            "Available rerankers: bge, cross_encoder\n"
-            "Available compression: redundancy_removal, contextual, llm\n\n"
-            "Respond in valid JSON only:\n"
-            '{{"chunkers": {{"name": weight}}, "retrievers": {{"name": weight}}, '
-            '"rerankers": {{"name": weight}}, "optimizers": ["name"], '
-            '"compression": "name", "top_k": int}}'
-        )
+        agent_prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are an expert retrieval strategy architect for a RAG (Retrieval-Augmented Generation) system. "
+             "Your task is to select the OPTIMAL combination of retrieval components based on the query type "
+             "and characteristics.\n\n"
+             "## Component Selection Guide\n\n"
+             "### Chunkers (select 1-3, weights must sum to ~1.0):\n"
+             "- semantic (0.3-0.7): Best for conceptual/analytical queries. Detects topic boundaries.\n"
+             "- parent_child (0.2-0.5): Best for queries needing broad context. Links child retrieval to parent context.\n"
+             "- recursive (0.2-0.4): Good general-purpose splitter. Best for procedural queries.\n"
+             "- fixed (0.1-0.3): Simple, fast. Use as backup.\n"
+             "- document_aware (0.2-0.4): Best for multi-format document collections.\n\n"
+             "### Retrievers (select 2-3, weights must sum to ~1.0):\n"
+             "- dense (0.3-0.6): Semantic similarity. Best for conceptual queries.\n"
+             "- bm25 (0.2-0.4): Keyword matching. Best for factual queries with specific terms.\n"
+             "- metadata (0.1-0.3): Keyword-refined retrieval. Good supplement.\n"
+             "- parent_child (0.2-0.4): Returns parent context. Best with parent_child chunker.\n\n"
+             "### Optimizers (select 1-3):\n"
+             "- multi_query: Best for broad recall. Generates query variants.\n"
+             "- hyde: Best for conceptual queries. Generates hypothetical answer as query.\n"
+             "- step_back: Best for specific queries needing broader context.\n"
+             "- query_expansion: Best for short or ambiguous queries.\n\n"
+             "### Rerankers (select 1-2, weights must sum to ~1.0):\n"
+             "- bge (0.5-0.8): Fast, good quality.\n"
+             "- cross_encoder (0.3-0.5): Slower, highest quality.\n\n"
+             "### Compression:\n"
+             "- redundancy_removal: Fast, removes duplicates. Good default.\n"
+             "- contextual: LLM extracts relevant sentences. Best for long documents.\n"
+             "- llm: Full LLM summarization. Best when context is scattered.\n\n"
+             "### Top-K:\n"
+             "- top_k_retrieval: 15-30 (how many docs to retrieve). Higher for broad queries.\n"
+             "- top_k_reranked: 5-15 (how many to keep after reranking). Lower for focused queries.\n\n"
+             "## Decision Rules:\n"
+             "- factual queries: Prefer bm25 + dense, lower top_k, redundancy_removal compression.\n"
+             "- analytical queries: Prefer dense + semantic chunking + hyde, higher top_k.\n"
+             "- comparative queries: Prefer multi_query + higher top_k + contextual compression.\n"
+             "- procedural queries: Prefer recursive chunking + step_back + dense."),
+            ("human",
+             "Select the optimal retrieval configuration for this query.\n\n"
+             "Query: {query}\n"
+             "Query Type: {query_type}\n\n"
+             "Respond with ONLY valid JSON, no explanation:\n"
+             '{{"chunkers": {{"name": weight}}, "retrievers": {{"name": weight}}, '
+             '"rerankers": {{"name": weight}}, "optimizers": ["name"], '
+             '"compression": "name", "top_k_retrieval": int, "top_k_reranked": int}}')
+        ])
         try:
             chain = agent_prompt | llm | StrOutputParser()
             raw = chain.invoke({"query": state["query"], "query_type": state["query_type"]})
@@ -1604,7 +1960,8 @@ def strategy_selection_node(state: RAREState) -> dict:
                 "rerankers": cfg["rerankers"],
                 "optimizers": cfg["query_optimizers"],
                 "compression": cfg["compression"],
-                "top_k": cfg["top_k"],
+                "top_k_retrieval": cfg["top_k_retrieval"],
+                "top_k_reranked": cfg["top_k_reranked"],
             }
     else:
         strategy = {
@@ -1613,7 +1970,8 @@ def strategy_selection_node(state: RAREState) -> dict:
             "rerankers": cfg["rerankers"],
             "optimizers": cfg["query_optimizers"],
             "compression": cfg["compression"],
-            "top_k": cfg["top_k"],
+            "top_k_retrieval": cfg["top_k_retrieval"],
+            "top_k_reranked": cfg["top_k_reranked"],
         }
 
     latency = time.time() - t0
@@ -1623,8 +1981,38 @@ def strategy_selection_node(state: RAREState) -> dict:
         "selected_optimizers": strategy.get("optimizers", cfg["query_optimizers"]),
         "selected_rerankers": strategy.get("rerankers", cfg["rerankers"]),
         "selected_compression": strategy.get("compression", cfg["compression"]),
-        "selected_top_k": strategy.get("top_k", cfg["top_k"]),
+        "selected_top_k_retrieval": strategy.get("top_k_retrieval", cfg["top_k_retrieval"]),
+        "selected_top_k_reranked": strategy.get("top_k_reranked", cfg["top_k_reranked"]),
         "node_latencies": {**state.get("node_latencies", {}), "strategy_selection": latency},
+    }
+
+
+# ---- NODE 2b: Ingestion & Chunking (Agent Mode) ----
+def ingestion_chunking_node(state: RAREState) -> dict:
+    """Re-chunk and re-index documents if agent mode selected different chunkers."""
+    t0 = time.time()
+    global _indexed_chunkers
+
+    selected_chunkers = state.get("selected_chunkers", {})
+    cfg = state.get("config_override") or CONFIG
+
+    # Check if we need to re-chunk
+    selected_set = set(selected_chunkers.keys()) if isinstance(selected_chunkers, dict) else set()
+
+    if selected_set and selected_set != _indexed_chunkers:
+        print(f"[INGESTION] Agent selected different chunkers: {selected_set} vs indexed: {_indexed_chunkers}")
+        # Validate chunker names
+        valid_chunkers = {k: v for k, v in selected_chunkers.items() if k in CHUNKER_REGISTRY}
+        if valid_chunkers:
+            ingestion_agent.run(raw_documents, valid_chunkers)
+        else:
+            print("[INGESTION] No valid chunkers in agent selection. Keeping existing indices.")
+    else:
+        print(f"[INGESTION] Chunkers match existing indices. Skipping re-indexing.")
+
+    latency = time.time() - t0
+    return {
+        "node_latencies": {**state.get("node_latencies", {}), "ingestion_chunking": latency},
     }
 
 
@@ -1632,29 +2020,41 @@ def strategy_selection_node(state: RAREState) -> dict:
 def query_optimization_node(state: RAREState) -> dict:
     t0 = time.time()
     query = state["query"]
-    q_type = state.get("query_type", "factual")
-    
-    # Conditional Routing
-    if q_type == "conceptual":
-        optimizer_names = ["hyde"]
-    elif q_type == "analytical":
-        optimizer_names = ["multi_query"]
-    else:
-        optimizer_names = ["query_expansion"]
-        
-    # Execute single best optimizer
+
+    # Use strategies selected by previous node
+    optimizer_names = state.get("selected_optimizers", [])
+
+    # Nothing selected -> skip node
+    if not optimizer_names:
+        latency = time.time() - t0
+        return {
+            "optimized_queries": [query],
+            "node_latencies": {
+                **state.get("node_latencies", {}),
+                "query_optimization": latency,
+            },
+        }
+
     all_queries = {query}
-    if optimizer_names[0] in OPTIMIZER_REGISTRY:
+
+    for optimizer_name in optimizer_names:
+        if optimizer_name not in OPTIMIZER_REGISTRY:
+            continue
         try:
-            expanded = OPTIMIZER_REGISTRY[optimizer_names[0]]().optimize(query)
-            all_queries.update(expanded)
+            optimizer = OPTIMIZER_REGISTRY[optimizer_name]()
+            expanded_queries = optimizer.optimize(query)
+            if expanded_queries:
+                all_queries.update(expanded_queries)
         except Exception as e:
-            print(f"[OPTIMIZER] {optimizer_names[0]} error: {e}")
+            print(f"[OPTIMIZER] {optimizer_name} error: {e}")
 
     latency = time.time() - t0
     return {
         "optimized_queries": list(all_queries),
-        "node_latencies": {**state.get("node_latencies", {}), "query_optimization": latency},
+        "node_latencies": {
+            **state.get("node_latencies", {}),
+            "query_optimization": latency,
+        },
     }
 
 
@@ -1662,11 +2062,20 @@ def query_optimization_node(state: RAREState) -> dict:
 def retrieval_node(state: RAREState) -> dict:
     t0 = time.time()
     queries = state.get("optimized_queries", [state["query"]])
-    top_k = state.get("selected_top_k", CONFIG["top_k"])
+    top_k_retrieval = state.get("selected_top_k_retrieval", CONFIG["top_k_retrieval"])
     retriever_config = state.get("selected_retrievers", CONFIG["retrievers"])
 
     ensemble = RetrievalEnsemble(retriever_config)
-    results = ensemble.retrieve(queries, top_k)
+    results = ensemble.retrieve(queries, top_k_retrieval)
+
+    # If web search was triggered (CRAG), merge web results
+    web_docs = state.get("web_search_documents", [])
+    if web_docs:
+        web_scored = [_dict_to_scored(d) for d in web_docs]
+        results.extend(web_scored)
+        # Re-sort by score
+        results.sort(key=lambda x: x.score, reverse=True)
+        results = results[:top_k_retrieval + len(web_docs)]  # Allow extra for web results
 
     latency = time.time() - t0
     return {
@@ -1679,9 +2088,10 @@ def retrieval_node(state: RAREState) -> dict:
 def reranking_node(state: RAREState) -> dict:
     t0 = time.time()
     docs = [_dict_to_scored(d) for d in state.get("retrieved_documents", [])]
+    top_k_reranked = state.get("selected_top_k_reranked", CONFIG["top_k_reranked"])
 
     if docs and ensemble_reranker.rerankers:
-        reranked = ensemble_reranker.rerank(state["query"], docs)
+        reranked = ensemble_reranker.rerank(state["query"], docs, top_k_reranked)
     else:
         reranked = docs
 
@@ -1699,7 +2109,7 @@ def confidence_evaluation_node(state: RAREState) -> dict:
     query = state["query"]
 
     # Coverage: what fraction of query terms appear in retrieved docs
-    query_terms = set(query.lower().split())
+    query_terms = set(re.findall(r"\w+", query.lower()))
     if docs and query_terms:
         doc_text = " ".join(d.content.lower() for d in docs[:10])
         covered = sum(1 for t in query_terms if t in doc_text)
@@ -1730,20 +2140,23 @@ def confidence_evaluation_node(state: RAREState) -> dict:
 
 # ---- CONDITIONAL: Should Retry? ----
 def should_retry(state: RAREState) -> Literal["retry", "continue"]:
-    threshold = CONFIG.get("confidence_threshold", 0.85)
+    threshold = CONFIG.get("confidence_threshold", 0.75)
     max_r = state.get("max_retries", CONFIG.get("max_retries", 3))
     if state.get("confidence_score", 0) < threshold and state.get("retry_count", 0) < max_r:
         return "retry"
     return "continue"
 
 
-# ---- NODE 7: Retry Adjustment ----
+# ---- NODE 7: Retry Adjustment (with CRAG on final retry) ----
 def retry_adjustment_node(state: RAREState) -> dict:
-    """Adjust strategy for retry: increase top_k, add optimizers."""
+    """Adjust strategy for retry: increase top_k, add optimizers.
+    On final retry (max_retries - 1), also trigger web search (CRAG).
+    """
     t0 = time.time()
     retry_count = state.get("retry_count", 0) + 1
-    current_top_k = state.get("selected_top_k", CONFIG["top_k"])
-    new_top_k = int(current_top_k * 1.5)
+    max_retries = state.get("max_retries", CONFIG.get("max_retries", 3))
+    current_top_k_retrieval = state.get("selected_top_k_retrieval", CONFIG["top_k_retrieval"])
+    new_top_k_retrieval = min(current_top_k_retrieval + 5, 50)
 
     optimizers = list(state.get("selected_optimizers", []))
     if "query_expansion" not in optimizers:
@@ -1758,13 +2171,29 @@ def retry_adjustment_node(state: RAREState) -> dict:
             if r not in retrievers:
                 retrievers[r] = 0.2
 
+    # CRAG: On final retry, trigger web search
+    web_search_docs = []
+    web_search_used = state.get("web_search_used", False)
+    if retry_count >= max_retries and not web_search_used:
+        print(f"[CRAG] Final retry reached. Triggering web search for: '{state['query'][:60]}...'")
+        web_results = web_search_engine.search(state["query"], num_results=5)
+        if web_results:
+            web_search_docs = [_scored_to_dict(r) for r in web_results]
+            web_search_used = True
+            print(f"[CRAG] Added {len(web_search_docs)} web search results to context.")
+        else:
+            print("[CRAG] Web search returned no results.")
+
     latency = time.time() - t0
-    print(f"[RETRY] Attempt {retry_count}: top_k={new_top_k}, optimizers={optimizers}")
+    print(f"[RETRY] Attempt {retry_count}: top_k_retrieval={new_top_k_retrieval}, "
+          f"optimizers={optimizers}, web_search={'YES' if web_search_used else 'NO'}")
     return {
         "retry_count": retry_count,
-        "selected_top_k": new_top_k,
+        "selected_top_k_retrieval": new_top_k_retrieval,
         "selected_optimizers": optimizers,
         "selected_retrievers": retrievers,
+        "web_search_used": web_search_used,
+        "web_search_documents": web_search_docs,
         "node_latencies": {**state.get("node_latencies", {}), f"retry_{retry_count}": latency},
     }
 
@@ -1799,14 +2228,36 @@ def response_generation_node(state: RAREState) -> dict:
     t0 = time.time()
     docs = state.get("compressed_documents", [])
     query = state["query"]
+    web_search_used = state.get("web_search_used", False)
 
     context = "\n\n---\n\n".join(d["content"] for d in docs[:8])
     llm = ChatOllama(model=OLLAMA_CONFIG["generation_model"], temperature=0.3)
-    prompt = ChatPromptTemplate.from_template(
-        "Answer the following question based on the provided context. "
-        "If the context does not contain enough information, say so.\n\n"
-        "Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"
-    )
+
+    # Enhanced generation prompt with anti-hallucination and completeness rules
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a precise, knowledgeable research assistant generating answers for a "
+         "Retrieval-Augmented Generation (RAG) system.\n\n"
+         "## Response Guidelines\n"
+         "1. BASE YOUR ANSWER SOLELY on the provided context. Do not use external knowledge.\n"
+         "2. Be COMPREHENSIVE: Address all aspects of the question using the available context.\n"
+         "3. Be SPECIFIC: Include exact technical terms, numbers, and data points from the context.\n"
+         "4. Be STRUCTURED: Use clear paragraphs. For complex answers, use bullet points or numbered lists.\n"
+         "5. CITE SOURCES: When referencing specific information, mention which part of the context it came from.\n"
+         "6. ACKNOWLEDGE GAPS: If the context doesn't fully answer the question, explicitly state what "
+         "information is missing rather than guessing.\n"
+         "7. NO HALLUCINATION: Never make claims not supported by the provided context.\n\n"
+         + ("Note: Some context was retrieved from web search to supplement local documents.\n\n" if web_search_used else "")
+         + "Think step-by-step:\n"
+         "1. Identify which parts of the context are relevant to the question.\n"
+         "2. Organize the relevant information logically.\n"
+         "3. Compose a comprehensive answer.\n"
+         "4. Verify every claim is grounded in the context."),
+        ("human",
+         "Context:\n{context}\n\n"
+         "Question: {query}\n\n"
+         "Answer:")
+    ])
     try:
         chain = prompt | llm | StrOutputParser()
         answer = chain.invoke({"context": context, "query": query})
@@ -1827,6 +2278,7 @@ workflow = StateGraph(RAREState)
 # Add nodes
 workflow.add_node("query_analysis", query_analysis_node)
 workflow.add_node("strategy_selection", strategy_selection_node)
+workflow.add_node("ingestion_chunking", ingestion_chunking_node)
 workflow.add_node("query_optimization", query_optimization_node)
 workflow.add_node("retrieval", retrieval_node)
 workflow.add_node("reranking", reranking_node)
@@ -1840,7 +2292,8 @@ workflow.set_entry_point("query_analysis")
 
 # Linear edges
 workflow.add_edge("query_analysis", "strategy_selection")
-workflow.add_edge("strategy_selection", "query_optimization")
+workflow.add_edge("strategy_selection", "ingestion_chunking")
+workflow.add_edge("ingestion_chunking", "query_optimization")
 workflow.add_edge("query_optimization", "retrieval")
 workflow.add_edge("retrieval", "reranking")
 workflow.add_edge("reranking", "confidence_evaluation")
@@ -1861,8 +2314,8 @@ workflow.add_edge("response_generation", END)
 rare_app = workflow.compile()
 print("[LANGGRAPH] Workflow compiled successfully.")
 print("[LANGGRAPH] Nodes:", [n for n in ["query_analysis", "strategy_selection",
-    "query_optimization", "retrieval", "reranking", "confidence_evaluation",
-    "retry_adjustment", "compression", "response_generation"]])
+    "ingestion_chunking", "query_optimization", "retrieval", "reranking",
+    "confidence_evaluation", "retry_adjustment", "compression", "response_generation"]])
 
 # ====================================================================
 # ## Section 15: Query Interface
@@ -1893,7 +2346,8 @@ def query_rare(q: str, config_override: dict = None, verbose: bool = True) -> di
         "selected_optimizers": [],
         "selected_rerankers": {},
         "selected_compression": "",
-        "selected_top_k": CONFIG["top_k"],
+        "selected_top_k_retrieval": CONFIG["top_k_retrieval"],
+        "selected_top_k_reranked": CONFIG["top_k_reranked"],
         "optimized_queries": [],
         "retrieved_documents": [],
         "reranked_documents": [],
@@ -1903,6 +2357,8 @@ def query_rare(q: str, config_override: dict = None, verbose: bool = True) -> di
         "context_quality": 0.0,
         "retry_count": 0,
         "max_retries": CONFIG.get("max_retries", 3),
+        "web_search_used": False,
+        "web_search_documents": [],
         "final_answer": "",
         "trace": {},
         "node_latencies": {},
@@ -1928,6 +2384,7 @@ def query_rare(q: str, config_override: dict = None, verbose: bool = True) -> di
         docs_after_rerank=len(result.get("reranked_documents", [])),
         docs_final=len(result.get("compressed_documents", [])),
         retry_count=result.get("retry_count", 0),
+        web_search_used=result.get("web_search_used", False),
         node_latencies=result.get("node_latencies", {}),
         total_latency=total_latency,
     )
@@ -2252,4 +2709,3 @@ print("[INFO] Leaderboard will be saved to /kaggle/working/leaderboard.csv")
 # To customize the pipeline, modify the `CONFIG` and `OLLAMA_CONFIG` dictionaries in Section 3.
 # No source code changes are required to change system behavior.
 # ====================================================================
-
